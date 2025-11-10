@@ -1,6 +1,8 @@
-geopandas
+streamlit
 pandas
-matplotlib
 numpy
-shapely
+matplotlib
 scipy
+geopandas
+shapely
+openpyxl
