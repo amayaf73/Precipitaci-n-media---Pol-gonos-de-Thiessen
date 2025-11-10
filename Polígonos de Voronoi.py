@@ -1,0 +1,467 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Polygon, Point, MultiPoint
+from scipy.spatial import Voronoi
+import matplotlib.pyplot as plt
+
+# --- Configuración de la Página ---
+st.set_page_config(layout="wide", page_title="Calculadora Thiessen")
+
+def find_index(col_list, possible_names, default=0):
+    """Intenta adivinar el índice de una columna basado en nombres comunes."""
+    possible_names_sorted = sorted(possible_names, key=len, reverse=True)
+    
+    for name in possible_names_sorted:
+        for i, col_name in enumerate(col_list):
+            if name.lower() in str(col_name).lower():
+                return i
+                
+    if default < len(col_list):
+        return default
+    return 0
+
+def cargar_datos_flex(tipo_datos, xls):
+    """Función para cargar una hoja de Excel de forma flexible."""
+    st.subheader(f"Cargar Hoja: {tipo_datos}")
+    
+    sheet_names = ["---"] + xls.sheet_names
+    selected_sheet = st.selectbox(f"Elige la hoja de Excel para '{tipo_datos}':", sheet_names, key=f"sheet_{tipo_datos}")
+    
+    if selected_sheet == "---":
+        return None
+
+    st.write("Indica dónde empiezan tus datos:")
+    
+    col_fila_header, col_fila_datos = st.columns(2)
+    with col_fila_header:
+        fila_header = st.number_input(
+            f"Fila del Encabezado ({tipo_datos})", 
+            min_value=0, 
+            value=0, 
+            step=1,
+            key=f"header_{tipo_datos}",
+            help="Fila con los nombres de columnas"
+        )
+    with col_fila_datos:
+        fila_datos = st.number_input(
+            f"Fila de Inicio de Datos ({tipo_datos})", 
+            min_value=1, 
+            value=1, 
+            step=1,
+            key=f"data_{tipo_datos}",
+            help="Primera fila con datos numéricos"
+        )
+
+    if fila_datos <= fila_header:
+        st.error("La 'Fila de Inicio de Datos' debe ser mayor que la 'Fila del Encabezado'.")
+        return None
+        
+    try:
+        df_temp = pd.read_excel(xls, sheet_name=selected_sheet, header=fila_header)
+        num_filas_basura = (fila_datos) - (fila_header + 1)
+        
+        if num_filas_basura < 0:
+             st.error("Error de lógica de filas.")
+             return None
+        
+        df_final = df_temp.iloc[num_filas_basura:].reset_index(drop=True).dropna(how='all')
+        
+        st.success(f"✅ Hoja '{selected_sheet}' cargada con {len(df_final)} filas:")
+        st.dataframe(df_final)
+        return df_final
+    
+    except Exception as e:
+        st.error(f"Error al leer la hoja: {e}")
+        return None
+
+def voronoi_finite_polygons_2d(vor, radius=None):
+    """
+    Reconstruye regiones infinitas de Voronoi en un polígono acotado.
+    Compatible con NumPy 2.0+
+    """
+    if vor.points.shape[1] != 2:
+        raise ValueError("Requiere puntos 2D")
+
+    new_regions = []
+    new_vertices = vor.vertices.tolist()
+
+    center = vor.points.mean(axis=0)
+    if radius is None:
+        radius = np.ptp(vor.points, axis=0).max() * 2
+
+    all_ridges = {}
+    for (p1, p2), (v1, v2) in zip(vor.ridge_points, vor.ridge_vertices):
+        all_ridges.setdefault(p1, []).append((p2, v1, v2))
+        all_ridges.setdefault(p2, []).append((p1, v1, v2))
+
+    for p1, region in enumerate(vor.point_region):
+        vertices = vor.regions[region]
+
+        if all(v >= 0 for v in vertices):
+            new_regions.append(vertices)
+            continue
+
+        ridges = all_ridges[p1]
+        new_region = [v for v in vertices if v >= 0]
+
+        for p2, v1, v2 in ridges:
+            if v2 < 0:
+                v1, v2 = v2, v1
+            if v1 >= 0:
+                continue
+
+            t = vor.points[p2] - vor.points[p1]
+            t /= np.linalg.norm(t)
+            n = np.array([-t[1], t[0]])
+
+            midpoint = vor.points[[p1, p2]].mean(axis=0)
+            direction = np.sign(np.dot(midpoint - center, n)) * n
+            far_point = vor.vertices[v2] + direction * radius
+
+            new_region.append(len(new_vertices))
+            new_vertices.append(far_point.tolist())
+
+        vs = np.asarray([new_vertices[v] for v in new_region])
+        c = vs.mean(axis=0)
+        angles = np.arctan2(vs[:, 1] - c[1], vs[:, 0] - c[0])
+        new_region = np.array(new_region)[np.argsort(angles)]
+
+        new_regions.append(new_region.tolist())
+
+    return new_regions, np.asarray(new_vertices)
+
+def main():
+    st.title("🌧️ Calculadora de Polígonos de Thiessen")
+    st.markdown("**Método de Voronoi para Precipitación Media Ponderada**")
+    
+    # Función auxiliar para convertir figura a bytes
+    def fig_to_bytes(fig):
+        import io
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+        buf.seek(0)
+        return buf
+    
+    st.sidebar.header("📁 Paso 1: Cargar Archivo")
+    uploaded_file = st.sidebar.file_uploader("Sube tu archivo Excel (.xlsx)", type=["xlsx"])
+
+    if uploaded_file is None:
+        st.info("👆 Sube un archivo Excel para comenzar.")
+        st.warning("📋 Tu Excel debe tener **2 hojas**: \n- Una para **Vértices de Cuenca**\n- Otra para **Estaciones (Pluviómetros)**")
+        return
+
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception as e:
+        st.error(f"❌ No se pudo leer el archivo Excel: {e}")
+        return
+    
+    st.header("📊 Paso 2: Cargar y Mapear Datos")
+    
+    df_cuenca = cargar_datos_flex("Vértices de Cuenca", xls)
+    
+    col_x_cuenca, col_y_cuenca = None, None
+    
+    if df_cuenca is not None:
+        st.subheader("🗺️ Mapeo de Columnas (Cuenca)")
+        all_cols_cuenca = df_cuenca.columns.tolist()
+        
+        idx_x_cuenca = find_index(all_cols_cuenca, ['X(und)', 'X', 'Coord X', 'Este'], default=1)
+        idx_y_cuenca = find_index(all_cols_cuenca, ['Y (und)', 'Y', 'Coord Y', 'Norte'], default=2)
+        
+        col_x_cuenca = st.selectbox("Columna X (Cuenca):", all_cols_cuenca, index=idx_x_cuenca, key="x_cuenca")
+        col_y_cuenca = st.selectbox("Columna Y (Cuenca):", all_cols_cuenca, index=idx_y_cuenca, key="y_cuenca")
+        
+    st.markdown("---")
+    
+    df_estaciones = cargar_datos_flex("Estaciones (Pluviómetros)", xls)
+    
+    col_p_est, col_x_est, col_y_est, col_nombre_est = None, None, None, None
+    
+    if df_estaciones is not None:
+        st.subheader("📍 Mapeo de Columnas (Estaciones)")
+        all_cols_estaciones = df_estaciones.columns.tolist()
+
+        idx_p_est = find_index(all_cols_estaciones, ['P (mm)', 'P(mm)', 'Precipitacion'], default=3)
+        idx_x_est = find_index(all_cols_estaciones, ['X', 'Coord X', 'Este'], default=1)
+        idx_y_est = find_index(all_cols_estaciones, ['Y', 'Coord Y', 'Norte'], default=2)
+
+        col_p_est = st.selectbox("Columna Precipitación (mm):", all_cols_estaciones, index=idx_p_est, key="p_est")
+        col_x_est = st.selectbox("Columna X (Estación):", all_cols_estaciones, index=idx_x_est, key="x_est")
+        col_y_est = st.selectbox("Columna Y (Estación):", all_cols_estaciones, index=idx_y_est, key="y_est")
+        
+        idx_nombre_est = find_index(all_cols_estaciones, ['Estacion', 'Nombre', 'Pluviometro'], default=0)
+        if idx_nombre_est != -1:
+            col_nombre_est = all_cols_estaciones[idx_nombre_est]
+
+    if df_cuenca is not None and df_estaciones is not None:
+        st.markdown("---")
+        st.header("⚡ Paso 3: Cálculo y Resultados")
+        
+        try:
+            # Limpiar datos
+            df_cuenca[col_x_cuenca] = pd.to_numeric(df_cuenca[col_x_cuenca], errors='coerce')
+            df_cuenca[col_y_cuenca] = pd.to_numeric(df_cuenca[col_y_cuenca], errors='coerce')
+            df_cuenca = df_cuenca.dropna(subset=[col_x_cuenca, col_y_cuenca])
+            
+            # Para estaciones
+            df_estaciones[col_x_est] = pd.to_numeric(df_estaciones[col_x_est], errors='coerce')
+            df_estaciones[col_y_est] = pd.to_numeric(df_estaciones[col_y_est], errors='coerce')
+            df_estaciones[col_p_est] = pd.to_numeric(df_estaciones[col_p_est], errors='coerce')
+            
+            # Mostrar TODAS las estaciones
+            st.write("**📋 Todas las Estaciones en el Excel:**")
+            df_display = df_estaciones.copy()
+            if col_nombre_est:
+                cols_display = [col_nombre_est, col_x_est, col_y_est, col_p_est]
+            else:
+                cols_display = [col_x_est, col_y_est, col_p_est]
+            st.dataframe(df_display[cols_display])
+            
+            # Eliminar filas sin coordenadas O sin precipitación
+            df_estaciones_limpio = df_estaciones.dropna(subset=[col_x_est, col_y_est, col_p_est]).copy()
+            
+            st.success(f"✅ **{len(df_estaciones_limpio)} estaciones válidas** (con X, Y y P completos)")
+            
+            if len(df_estaciones_limpio) != len(df_estaciones):
+                faltantes = len(df_estaciones) - len(df_estaciones_limpio)
+                st.warning(f"⚠️ Se omitieron {faltantes} fila(s) por tener datos incompletos")
+
+            # Crear polígono de cuenca
+            coords_cuenca = list(zip(df_cuenca[col_x_cuenca], df_cuenca[col_y_cuenca]))
+            if len(coords_cuenca) < 3:
+                st.error("Necesitas al menos 3 vértices para la cuenca.")
+                return
+            
+            if coords_cuenca[0] != coords_cuenca[-1]:
+                coords_cuenca.append(coords_cuenca[0])
+            
+            cuenca_poly = Polygon(coords_cuenca)
+            
+            if not cuenca_poly.is_valid:
+                cuenca_poly = cuenca_poly.buffer(0)
+            
+            st.success("✅ Polígono de cuenca creado")
+
+            # Preparar estaciones
+            if len(df_estaciones_limpio) < 2:
+                st.error("Se necesitan al menos 2 estaciones válidas.")
+                return
+            
+            df_estaciones_limpio = df_estaciones_limpio.reset_index(drop=True)
+            
+            puntos = np.array(list(zip(df_estaciones_limpio[col_x_est], df_estaciones_limpio[col_y_est])))
+            precipitaciones = df_estaciones_limpio[col_p_est].values
+            
+            # Calcular Voronoi
+            st.write("🔄 Calculando polígonos de Voronoi...")
+            vor = Voronoi(puntos)
+            regions, vertices = voronoi_finite_polygons_2d(vor)
+            
+            # Crear polígonos y calcular áreas
+            resultados = []
+            
+            for i, region in enumerate(regions):
+                polygon = Polygon(vertices[region])
+                interseccion = polygon.intersection(cuenca_poly)
+                
+                if not interseccion.is_empty:
+                    area = interseccion.area
+                    p_i = precipitaciones[i]
+                    
+                    resultado = {
+                        'Indice': i + 1,
+                        'P (mm)': p_i,
+                        'Area_Poligono': area,
+                        'geometry': interseccion
+                    }
+                    
+                    if col_nombre_est and col_nombre_est in df_estaciones_limpio.columns:
+                        nombre = df_estaciones_limpio.iloc[i][col_nombre_est]
+                        resultado['Pluviometro'] = nombre
+                    
+                    resultados.append(resultado)
+            
+            if not resultados:
+                st.error("No se pudo calcular ningún polígono dentro de la cuenca.")
+                return
+            
+            gdf_final = gpd.GeoDataFrame(resultados)
+            
+            # Calcular áreas y ponderados
+            area_total = gdf_final['Area_Poligono'].sum()
+            gdf_final['Proporcion'] = gdf_final['Area_Poligono'] / area_total
+            gdf_final['P_x_Area'] = gdf_final['P (mm)'] * gdf_final['Area_Poligono']
+            gdf_final['P_ponderado'] = gdf_final['P (mm)'] * gdf_final['Proporcion']
+            
+            p_x_a_total = gdf_final['P_x_Area'].sum()
+            p_media = p_x_a_total / area_total
+            
+            # Mostrar resultados
+            st.markdown("---")
+            st.subheader("🎯 Resultados del Método de Thiessen")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Precipitación Media", f"{p_media:.2f} mm", help="Precipitación media ponderada por áreas")
+            with col2:
+                st.metric("Área Total", f"{area_total:.2f} und²", help="Suma de todas las áreas")
+            with col3:
+                st.metric("N° Polígonos", len(gdf_final), help="Número de polígonos de Thiessen")
+            
+            st.write("**📊 Tabla Detallada de Resultados:**")
+            
+            cols_mostrar = ['Indice', 'P (mm)', 'Area_Poligono', 'Proporcion', 'P_ponderado']
+            if 'Pluviometro' in gdf_final.columns:
+                cols_mostrar.insert(1, 'Pluviometro')
+            
+            df_mostrar = gdf_final[cols_mostrar].copy()
+            df_mostrar['Area_Poligono'] = df_mostrar['Area_Poligono'].round(4)
+            df_mostrar['Proporcion'] = (df_mostrar['Proporcion'] * 100).round(2).astype(str) + '%'
+            df_mostrar['P_ponderado'] = df_mostrar['P_ponderado'].round(2)
+            
+            st.dataframe(df_mostrar, use_container_width=True)
+            
+            st.write("**✅ Verificación del Cálculo:**")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"- Σ(P_i × A_i) = **{p_x_a_total:.2f}**")
+                st.write(f"- Σ(A_i) = **{area_total:.2f}**")
+            with col2:
+                st.write(f"- Suma proporciones = **{gdf_final['Proporcion'].sum():.4f}** (debe ser 1.0)")
+                st.write(f"- Suma P_ponderado = **{gdf_final['P_ponderado'].sum():.2f} mm**")
+            
+            st.info(f"""
+            **📐 Fórmula de Thiessen:**
+            
+            ```
+            P_media = Σ(P_i × A_i) / Σ(A_i)
+            P_media = {p_x_a_total:.2f} / {area_total:.2f} = {p_media:.2f} mm
+            ```
+            """)
+            
+            # Mapa
+            st.markdown("---")
+            st.subheader("🗺️ Mapa de Polígonos de Thiessen")
+            
+            fig, ax = plt.subplots(figsize=(16, 11))
+            fig.patch.set_facecolor('white')
+            ax.set_facecolor('#f8f9fa')
+            
+            # Paleta de colores profesional
+            colors = ['#8dd3c7', '#ffffb3', '#bebada', '#fb8072', '#80b1d3', '#fdb462', '#b3de69', '#fccde5']
+            
+            # Dibujar polígonos con degradado suave
+            for idx, row in gdf_final.iterrows():
+                xs, ys = row['geometry'].exterior.xy
+                color_idx = idx % len(colors)
+                ax.fill(xs, ys, alpha=0.75, edgecolor='#2c3e50', linewidth=1.8, 
+                       color=colors[color_idx], zorder=1)
+                
+                # Etiqueta de área - más elegante
+                centroid = row['geometry'].centroid
+                area_label = f"{row['Area_Poligono']:.2f} und²"
+                
+                # Texto con sombra para mejor legibilidad
+                ax.text(centroid.x, centroid.y, area_label, 
+                       ha='center', va='center', fontsize=11, fontweight='600',
+                       color='#2c3e50',
+                       bbox=dict(boxstyle='round,pad=0.5', facecolor='white', 
+                                alpha=0.95, edgecolor='#95a5a6', linewidth=1.5),
+                       zorder=50)
+            
+            # Límite de cuenca más elegante
+            xs, ys = cuenca_poly.exterior.xy
+            ax.plot(xs, ys, color='#e74c3c', linewidth=3.5, label='Límite de Cuenca', 
+                   zorder=100, solid_capstyle='round')
+            
+            # Estaciones con estilo más profesional
+            ax.scatter(puntos[:, 0], puntos[:, 1], s=180, c='#c0392b', 
+                      edgecolors='white', linewidths=2.5, label='Estaciones', 
+                      zorder=200, marker='o', alpha=0.95)
+            
+            # Etiquetas de estaciones más refinadas
+            if col_nombre_est and col_nombre_est in df_estaciones_limpio.columns:
+                for i, (x, y) in enumerate(puntos):
+                    nombre = df_estaciones_limpio.iloc[i][col_nombre_est]
+                    p_val = precipitaciones[i]
+                    
+                    # Etiqueta con dos líneas
+                    label_text = f"{nombre}\nP = {p_val:.0f} mm"
+                    
+                    # Offset inteligente basado en posición
+                    offset_x = 1.2 if x < puntos[:, 0].mean() else -1.2
+                    offset_y = 0.8
+                    
+                    ax.annotate(label_text, 
+                               xy=(x, y), 
+                               xytext=(x + offset_x, y + offset_y),
+                               fontsize=10, 
+                               fontweight='bold',
+                               color='#2c3e50',
+                               ha='center',
+                               bbox=dict(boxstyle='round,pad=0.5', 
+                                        facecolor='#fff9c4', 
+                                        edgecolor='#f39c12', 
+                                        linewidth=2,
+                                        alpha=0.95),
+                               arrowprops=dict(arrowstyle='->', 
+                                             connectionstyle='arc3,rad=0.2',
+                                             color='#7f8c8d', 
+                                             lw=1.5),
+                               zorder=150)
+            
+            # Título más profesional
+            title_text = f"Polígonos de Thiessen\nPrecipitación Media Ponderada = {p_media:.2f} mm"
+            ax.set_title(title_text, fontsize=19, fontweight='bold', 
+                        color='#2c3e50', pad=25, 
+                        bbox=dict(boxstyle='round,pad=0.8', 
+                                 facecolor='#ecf0f1', 
+                                 edgecolor='#95a5a6', 
+                                 linewidth=2))
+            
+            # Ejes más elegantes
+            ax.set_xlabel("Coordenada X (unidades)", fontsize=13, fontweight='600', color='#34495e')
+            ax.set_ylabel("Coordenada Y (unidades)", fontsize=13, fontweight='600', color='#34495e')
+            
+            # Grid sutil
+            ax.grid(True, alpha=0.25, linestyle='--', linewidth=0.8, color='#7f8c8d')
+            
+            # Leyenda elegante
+            legend = ax.legend(fontsize=12, loc='upper right', 
+                             framealpha=0.95, 
+                             edgecolor='#95a5a6',
+                             fancybox=True,
+                             shadow=True,
+                             title='Leyenda',
+                             title_fontsize=13)
+            legend.get_frame().set_facecolor('white')
+            legend.get_frame().set_linewidth(1.5)
+            
+            # Bordes del gráfico
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#95a5a6')
+                spine.set_linewidth(1.5)
+            
+            ax.set_aspect('equal')
+            plt.tight_layout()
+            
+            st.pyplot(fig)
+            
+            # Botón de descarga
+            st.download_button(
+                label="📥 Descargar Mapa (PNG)",
+                data=fig_to_bytes(fig),
+                file_name=f"thiessen_map_P{p_media:.2f}mm.png",
+                mime="image/png"
+            )
+            
+        except Exception as e:
+            st.error(f"❌ Error durante el cálculo: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
